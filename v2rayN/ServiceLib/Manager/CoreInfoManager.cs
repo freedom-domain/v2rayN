@@ -103,7 +103,7 @@ public sealed class CoreInfoManager
                 new CoreInfo
                 {
                     CoreType = ECoreType.Xray,
-                    CoreExes = ["xray2"],
+                    CoreExes = ["xray-new"],
                     Arguments = "run -c {0}",
                     Url = GetCoreUrl(ECoreType.Xray),
                     ReleaseApiUrl = urlXray.Replace(Global.GithubUrl, Global.GithubApiUrl),
