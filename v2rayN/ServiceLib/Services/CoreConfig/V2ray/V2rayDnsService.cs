@@ -17,24 +17,24 @@ public partial class CoreConfigV2rayService
                 }
 
                 // DNS routing
-                var dnsObj = JsonUtils.SerializeToNode(_coreConfig.dns);
-                if (dnsObj == null)
+                var dnsNode = JsonUtils.SerializeToNode(_coreConfig.dns);
+                if (dnsNode is not JsonObject dnsObj)
                 {
                     return;
                 }
 
                 dnsObj["tag"] = Global.DnsTag;
-                _coreConfig.dns = JsonUtils.Deserialize<Dns4Ray>(JsonUtils.Serialize(dnsObj));
+                _coreConfig.dns = dnsObj;
                 _coreConfig.routing.rules.Add(new RulesItem4Ray
                 {
                     type = "field",
-                    inboundTag = new List<string> { Global.DnsTag },
+                    inboundTag = [Global.DnsTag],
                     outboundTag = Global.ProxyTag,
                 });
                 return;
             }
             var simpleDnsItem = context.SimpleDnsItem;
-            var dnsItem = _coreConfig.dns is Dns4Ray dns4Ray ? dns4Ray : new Dns4Ray();
+            var dnsItem = new Dns4Ray();
 
             var strategy4Freedom = simpleDnsItem?.Strategy4Freedom ?? Global.AsIs;
             //Outbound Freedom domainStrategy
@@ -43,11 +43,7 @@ public partial class CoreConfigV2rayService
                 var outbound = _coreConfig.outbounds.FirstOrDefault(t => t is { protocol: "freedom", tag: Global.DirectTag });
                 if (outbound != null)
                 {
-                    outbound.settings = new()
-                    {
-                        domainStrategy = strategy4Freedom,
-                        userLevel = 0
-                    };
+                    FillSockoptDomainStrategy(outbound, strategy4Freedom);
                 }
             }
 
@@ -64,11 +60,32 @@ public partial class CoreConfigV2rayService
                     .ForEach(outbound => outbound.targetStrategy = strategy4Proxy);
             }
 
+            var strategy4DialProxy = simpleDnsItem?.Strategy4ProxyDial ?? Global.AsIs;
+            //Outbound DialProxy domainStrategy
+            if (strategy4DialProxy.IsNotEmpty() && strategy4DialProxy != Global.AsIs)
+            {
+                var xraySupportConfigTypeNames = Global.XraySupportConfigType
+                        .Select(x => x == EConfigType.Hysteria2 ? "hysteria" : Global.ProtocolTypes[x])
+                        .ToHashSet();
+                _coreConfig.outbounds
+                    .Where(t => xraySupportConfigTypeNames.Contains(t.protocol))
+                    .ToList()
+                    .ForEach(outbound =>
+                    {
+                        FillSockoptDomainStrategy(outbound, strategy4DialProxy);
+                    });
+            }
+
             FillDnsServers(dnsItem);
             FillDnsHosts(dnsItem);
 
             dnsItem.serveStale = simpleDnsItem?.ServeStale is true ? true : null;
             dnsItem.enableParallelQuery = simpleDnsItem?.ParallelQuery is true ? true : null;
+
+            if (simpleDnsItem.BlockAAAAQuery == true)
+            {
+                dnsItem.queryStrategy = "UseIPv4";
+            }
 
             // DNS routing
             var directDnsTags = dnsItem.servers
@@ -100,11 +117,49 @@ public partial class CoreConfigV2rayService
                 balancerTag = finalRule.balancerTag,
             });
 
-            _coreConfig.dns = dnsItem;
+            _coreConfig.dns = (JsonObject)JsonUtils.SerializeToNode(dnsItem);
         }
         catch (Exception ex)
         {
             Logging.SaveLog(_tag, ex);
+        }
+    }
+
+    private void GenFakeDns()
+    {
+        var fakeipRange = _config.SimpleDNSItem.FakeIPRange.IsNullOrEmpty() ? Global.FakeIPRanges.First() : _config.SimpleDNSItem.FakeIPRange;
+        var poolSize = 65535L;
+        try
+        {
+            var fakeipNetwork = IPNetwork2.Parse(fakeipRange);
+            var totalIPs = fakeipNetwork.Total;
+            // see https://github.com/XTLS/Xray-core/blob/6e3322d219140a025285ded1114fe17a5edb74d8/app/dns/fakedns/fake.go#L88
+            // if math.Log2(float64(lruSize)) >= float64(rooms) { return errors.New("LRU size is bigger than subnet size").AtError() }
+            totalIPs -= 1;
+            if (totalIPs > 0)
+            {
+                poolSize = (totalIPs >= long.MaxValue) ? long.MaxValue : (long)totalIPs;
+            }
+        }
+        catch
+        {
+            // Ignore
+        }
+        var fakeDns = new FakeDns4Ray
+        {
+            ipPool = fakeipRange,
+            poolSize = poolSize,
+        };
+        _coreConfig.fakedns = JsonUtils.SerializeToNode(fakeDns);
+        if (_config.SimpleDNSItem.FakeIPv6 == true && _config.SimpleDNSItem.BlockAAAAQuery != true)
+        {
+            if (!FakeIPUtils.TryParseIPv6Range(_config.SimpleDNSItem.FakeIPv6Range, out var range6, out var poolSize6))
+            {
+                throw new ArgumentException("Invalid IPv6 FakeIP range.");
+            }
+            _coreConfig.fakedns = new JsonArray(
+                _coreConfig.fakedns,
+                JsonUtils.SerializeToNode(new FakeDns4Ray { ipPool = range6, poolSize = poolSize6 }));
         }
     }
 
@@ -115,16 +170,16 @@ public partial class CoreConfigV2rayService
         var directDNSAddress = ParseDnsAddresses(simpleDNSItem?.DirectDNS, Global.DomainDirectDNSAddress.First());
         var remoteDNSAddress = ParseDnsAddresses(simpleDNSItem?.RemoteDNS, Global.DomainRemoteDNSAddress.First());
 
-        var directDomainList = new List<string>();
-        var directGeositeList = new List<string>();
-        var proxyDomainList = new List<string>();
-        var proxyGeositeList = new List<string>();
-        var expectedDomainList = new List<string>();
-        var expectedIPs = new List<string>();
-        var regionNames = new HashSet<string>();
+        var directDomainList = new HashSet<string>();
+        var directGeositeList = new HashSet<string>();
+        var proxyDomainList = new HashSet<string>();
+        var proxyGeositeList = new HashSet<string>();
+        var expectedDomainList = new HashSet<string>();
+        var expectedIPs = new HashSet<string>();
+        var regionName = string.Empty;
 
         var bootstrapDNSAddress = ParseDnsAddresses(simpleDNSItem?.BootstrapDNS, Global.DomainPureIPDNSAddress.First());
-        var dnsServerDomains = new List<string>();
+        var dnsServerDomains = new HashSet<string>();
 
         foreach (var dns in directDNSAddress)
         {
@@ -150,28 +205,22 @@ public partial class CoreConfigV2rayService
                 dnsServerDomains.Add($"full:{domain}");
             }
         }
-        dnsServerDomains = dnsServerDomains.Distinct().ToList();
 
         if (!string.IsNullOrEmpty(simpleDNSItem?.DirectExpectedIPs))
         {
-            expectedIPs = simpleDNSItem.DirectExpectedIPs
-                .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+            expectedIPs = (Utils.String2List(simpleDNSItem.DirectExpectedIPs) ?? [])
                 .Select(s => s.Trim())
                 .Where(s => !string.IsNullOrEmpty(s))
-                .ToList();
+                .ToHashSet();
 
-            foreach (var ip in expectedIPs)
+            foreach (var region in from ip in expectedIPs
+                                   where ip.StartsWith(Global.GeoIPPrefix, StringComparison.OrdinalIgnoreCase)
+                                   select ip[Global.GeoIPPrefix.Length..]
+                                   into region
+                                   where !string.IsNullOrEmpty(region)
+                                   select region)
             {
-                if (ip.StartsWith("geoip:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var region = ip["geoip:".Length..];
-                    if (!string.IsNullOrEmpty(region))
-                    {
-                        regionNames.Add($"geosite:{region}");
-                        regionNames.Add($"geosite:geolocation-{region}");
-                        regionNames.Add($"geosite:tld-{region}");
-                    }
-                }
+                regionName = region;
             }
         }
 
@@ -201,9 +250,14 @@ public partial class CoreConfigV2rayService
 
                 if (item.OutboundTag == Global.DirectTag)
                 {
-                    if (normalizedDomain.StartsWith("geosite:") || normalizedDomain.StartsWith("ext:"))
+                    if (normalizedDomain.StartsWith(Global.GeoSitePrefix) || normalizedDomain.StartsWith("ext:"))
                     {
-                        (regionNames.Contains(normalizedDomain) ? expectedDomainList : directGeositeList).Add(normalizedDomain);
+                        var isExpectedDomain = !regionName.IsNullOrEmpty()
+                            && (normalizedDomain.EndsWith($"-{regionName}")
+                            || normalizedDomain.EndsWith($"@{regionName}")
+                            || normalizedDomain == Global.GeoSitePrefix + regionName);
+                        var targetList = isExpectedDomain ? expectedDomainList : directGeositeList;
+                        targetList.Add(normalizedDomain);
                     }
                     else
                     {
@@ -212,7 +266,7 @@ public partial class CoreConfigV2rayService
                 }
                 else if (item.OutboundTag != Global.BlockTag)
                 {
-                    if (normalizedDomain.StartsWith("geosite:") || normalizedDomain.StartsWith("ext:"))
+                    if (normalizedDomain.StartsWith(Global.GeoSitePrefix) || normalizedDomain.StartsWith("ext:"))
                     {
                         proxyGeositeList.Add(normalizedDomain);
                     }
@@ -224,28 +278,45 @@ public partial class CoreConfigV2rayService
             }
         }
 
-        if (context.ProtectDomainList.Count > 0)
-        {
-            directDomainList.AddRange(context.ProtectDomainList);
-        }
-
         dnsItem.servers ??= [];
 
         var directDnsTagIndex = 1;
+
+        if (dnsServerDomains.Count > 0)
+        {
+            AddDnsServers(bootstrapDNSAddress, dnsServerDomains);
+        }
+        if (context.ProtectDomainList.Count > 0)
+        {
+            AddDnsServers(directDNSAddress, context.ProtectDomainList, true);
+        }
+
+        if (simpleDNSItem.FakeIP == true)
+        {
+            var fakeIPMatchDomain = new HashSet<string>(proxyDomainList);
+            fakeIPMatchDomain.UnionWith(proxyGeositeList);
+            if (simpleDNSItem.GlobalFakeIp != false)
+            {
+                fakeIPMatchDomain.UnionWith(directDomainList);
+                fakeIPMatchDomain.UnionWith(directGeositeList);
+                fakeIPMatchDomain.UnionWith(expectedDomainList);
+            }
+            if (fakeIPMatchDomain.Count > 0)
+            {
+                GenFakeDns();
+                AddDnsServers(["fakedns"], fakeIPMatchDomain);
+            }
+        }
 
         AddDnsServers(remoteDNSAddress, proxyDomainList);
         AddDnsServers(directDNSAddress, directDomainList, true);
         AddDnsServers(remoteDNSAddress, proxyGeositeList);
         AddDnsServers(directDNSAddress, directGeositeList, true);
         AddDnsServers(directDNSAddress, expectedDomainList, true, expectedIPs);
-        if (dnsServerDomains.Count > 0)
-        {
-            AddDnsServers(bootstrapDNSAddress, dnsServerDomains);
-        }
 
         var useDirectDns = false;
 
-        if (rules?.LastOrDefault() is { } lastRule && lastRule.OutboundTag == Global.DirectTag)
+        if (rules?.LastOrDefault() is { OutboundTag: Global.DirectTag } lastRule)
         {
             var noDomain = lastRule.Domain == null || lastRule.Domain.Count == 0;
             var noProcess = lastRule.Process == null || lastRule.Process.Count == 0;
@@ -257,7 +328,7 @@ public partial class CoreConfigV2rayService
 
         if (!useDirectDns)
         {
-            dnsItem.servers.AddRange(remoteDNSAddress);
+            dnsItem.servers.AddRange(JsonUtils.SerializeToArray(remoteDNSAddress));
         }
         else
         {
@@ -266,15 +337,14 @@ public partial class CoreConfigV2rayService
                 var dnsServer = CreateDnsServer(dns, []);
                 dnsServer.tag = $"{Global.DirectDnsTag}-{directDnsTagIndex++}";
                 dnsServer.skipFallback = false;
-                dnsItem.servers.Add(JsonUtils.SerializeToNode(dnsServer,
-                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull }));
+                dnsItem.servers.Add(JsonUtils.SerializeToNode(dnsServer));
             }
         }
         return;
 
         static List<string> ParseDnsAddresses(string? dnsInput, string defaultAddress)
         {
-            var addresses = dnsInput?.Split(dnsInput.Contains(',') ? ',' : ';')
+            var addresses = (Utils.String2List(dnsInput) ?? [])
                 .Select(addr => addr.Trim())
                 .Where(addr => !string.IsNullOrEmpty(addr))
                 .Select(addr => addr.StartsWith("dhcp", StringComparison.OrdinalIgnoreCase) ? "localhost" : addr)
@@ -283,7 +353,7 @@ public partial class CoreConfigV2rayService
             return addresses.Count > 0 ? addresses : new List<string> { defaultAddress };
         }
 
-        static DnsServer4Ray CreateDnsServer(string dnsAddress, List<string> domains, List<string>? expectedIPs = null)
+        static DnsServer4Ray CreateDnsServer(string dnsAddress, HashSet<string> domains, HashSet<string>? expectedIPs = null)
         {
             var (domain, scheme, port, path) = Utils.ParseUrl(dnsAddress);
             var domainFinal = dnsAddress;
@@ -303,27 +373,33 @@ public partial class CoreConfigV2rayService
                 address = domainFinal,
                 port = portFinal,
                 skipFallback = true,
-                domains = domains.Count > 0 ? domains : null,
-                expectedIPs = expectedIPs?.Count > 0 ? expectedIPs : null
+                domains = domains.Count > 0 ? domains.ToList() : null,
+                expectedIPs = expectedIPs?.Count > 0 ? expectedIPs.ToList() : null
             };
             return dnsServer;
         }
 
-        void AddDnsServers(List<string> dnsAddresses, List<string> domains, bool isDirectDns = false, List<string>? expectedIPs = null)
+        void AddDnsServers(List<string> dnsAddresses, HashSet<string> domains, bool isDirectDns = false, HashSet<string>? expectedIPs = null)
         {
             if (domains.Count <= 0)
             {
                 return;
             }
-            foreach (var dnsAddress in dnsAddresses)
+            //foreach (var dnsAddress in dnsAddresses)
+            for (var i = 0; i < dnsAddresses.Count; i++)
             {
+                var dnsAddress = dnsAddresses[i];
                 var dnsServer = CreateDnsServer(dnsAddress, domains, expectedIPs);
                 if (isDirectDns)
                 {
                     dnsServer.tag = $"{Global.DirectDnsTag}-{directDnsTagIndex++}";
                 }
-                var dnsServerNode = JsonUtils.SerializeToNode(dnsServer,
-                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                if (expectedIPs is not null
+                    && i == expectedIPs.Count - 1)
+                {
+                    dnsServer.finalQuery = true;
+                }
+                var dnsServerNode = JsonUtils.SerializeToNode(dnsServer);
                 dnsItem.servers.Add(dnsServerNode);
             }
         }
@@ -336,12 +412,12 @@ public partial class CoreConfigV2rayService
         {
             return;
         }
-        dnsItem.hosts ??= new Dictionary<string, object>();
+        dnsItem.hosts ??= new Dictionary<string, JsonNode>();
         if (simpleDNSItem.AddCommonHosts == true)
         {
             dnsItem.hosts = Global.PredefinedHosts.ToDictionary(
                 kvp => kvp.Key,
-                kvp => (object)kvp.Value
+                kvp => (JsonNode)JsonUtils.SerializeToArray(kvp.Value)
             );
         }
 
@@ -354,14 +430,14 @@ public partial class CoreConfigV2rayService
             {
                 foreach (var host in systemHosts)
                 {
-                    normalHost.TryAdd(host.Key, new List<string> { host.Value });
+                    normalHost.TryAdd(host.Key, JsonUtils.SerializeToArray(new List<string> { host.Value }));
                 }
             }
         }
 
         foreach (var kvp in Utils.ParseHostsToDictionary(simpleDNSItem.Hosts))
         {
-            dnsItem.hosts[kvp.Key] = kvp.Value;
+            dnsItem.hosts[kvp.Key] = JsonUtils.SerializeToArray(kvp.Value);
         }
     }
 
@@ -370,11 +446,11 @@ public partial class CoreConfigV2rayService
         try
         {
             var item = context.RawDnsItem;
-            var normalDNS = item?.NormalDNS;
+            var customDNS = context.IsTunEnabled ? item?.TunDNS : item?.NormalDNS;
             var domainStrategy4Freedom = item?.DomainStrategy4Freedom;
-            if (normalDNS.IsNullOrEmpty())
+            if (customDNS.IsNullOrEmpty())
             {
-                normalDNS = EmbedUtils.GetEmbedText(Global.DNSV2rayNormalFileName);
+                customDNS = EmbedUtils.GetEmbedText(Global.DNSV2rayNormalFileName);
             }
 
             //Outbound Freedom domainStrategy
@@ -383,23 +459,22 @@ public partial class CoreConfigV2rayService
                 var outbound = _coreConfig.outbounds.FirstOrDefault(t => t is { protocol: "freedom", tag: Global.DirectTag });
                 if (outbound != null)
                 {
-                    outbound.settings = new();
-                    outbound.settings.domainStrategy = domainStrategy4Freedom;
-                    outbound.settings.userLevel = 0;
+                    outbound.streamSettings ??= new();
+                    outbound.streamSettings.sockopt ??= new();
+                    outbound.streamSettings.sockopt.domainStrategy = domainStrategy4Freedom;
                 }
             }
 
-            var obj = JsonUtils.ParseJson(normalDNS);
-            if (obj is null)
+            var node = JsonUtils.ParseJson(customDNS);
+            if (node is not JsonObject obj)
             {
                 List<string> servers = [];
-                var arrDNS = normalDNS.Split(',');
+                var arrDNS = customDNS.Split(',');
                 foreach (var str in arrDNS)
                 {
                     servers.Add(str);
                 }
-                obj = JsonUtils.ParseJson("{}");
-                obj["servers"] = JsonUtils.SerializeToNode(servers);
+                obj = new JsonObject { ["servers"] = JsonUtils.SerializeToNode(servers) };
             }
 
             // Append to dns settings
@@ -467,5 +542,29 @@ public partial class CoreConfigV2rayService
             domains = domainList.ToList(),
         };
         servers.AsArray().Add(JsonUtils.SerializeToNode(dnsServer));
+    }
+
+    private void FillSockoptDomainStrategy(Outbounds4Ray outbound, string? domainStrategy, bool skipHappyEyeballs = false)
+    {
+        if (domainStrategy.IsNullOrEmpty())
+        {
+            return;
+        }
+        outbound.streamSettings ??= new();
+        outbound.streamSettings.sockopt ??= new();
+        var sockopt = outbound.streamSettings.sockopt;
+        sockopt.domainStrategy = domainStrategy;
+
+        if (skipHappyEyeballs || _config.SimpleDNSItem.EnableHappyEyeballs != true)
+        {
+            return;
+        }
+        var happyEyeballsItem = _config.HappyEyeballs4RayItem;
+        sockopt.happyEyeballs ??= new();
+        var happyEyeballs = sockopt.happyEyeballs;
+        happyEyeballs.tryDelayMs = happyEyeballsItem.TryDelayMs;
+        happyEyeballs.prioritizeIPv6 = happyEyeballsItem.PrioritizeIPv6;
+        happyEyeballs.interleave = happyEyeballsItem.Interleave;
+        happyEyeballs.maxConcurrentTry = happyEyeballsItem.MaxConcurrentTry;
     }
 }
